@@ -70,31 +70,43 @@ class TestOccurrenceHelpers(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(reason, "NO_PREVIOUS_OCCURRENCE")
 
-    def test_within_three_days_skipped(self):
+    def test_within_window_skipped(self):
         from datetime import datetime, timedelta, timezone
         now = datetime(2026, 8, 4, tzinfo=timezone.utc)
         scraped = now - timedelta(days=2)
-        with patch.object(db, "get_latest_project_occurrence", return_value={"scraped_at": scraped.isoformat()}):
+        with patch.dict(os.environ, {"OCCURRENCE_WINDOW_DAYS": "7"}, clear=False), \
+             patch.object(db, "get_latest_project_occurrence", return_value={"scraped_at": scraped.isoformat()}):
             ok, reason = db.should_process_project("fintalent", "abc", now=now)
             self.assertFalse(ok)
-            self.assertEqual(reason, "WITHIN_THREE_DAY_WINDOW")
+            self.assertTrue(reason.startswith("skipped_within_7_days_age_"))
 
-    def test_exactly_three_days_skipped(self):
+    def test_exactly_n_days_skipped(self):
         from datetime import datetime, timedelta, timezone
         now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
-        scraped = now - timedelta(days=3)
-        with patch.object(db, "get_latest_project_occurrence", return_value={"scraped_at": scraped.isoformat()}):
+        scraped = now - timedelta(days=7)
+        with patch.dict(os.environ, {"OCCURRENCE_WINDOW_DAYS": "7"}, clear=False), \
+             patch.object(db, "get_latest_project_occurrence", return_value={"scraped_at": scraped.isoformat()}):
             ok, reason = db.should_process_project("fintalent", "abc", now=now)
             self.assertFalse(ok)
+            self.assertTrue(reason.startswith("skipped_within_7_days_age_"))
 
-    def test_more_than_three_days_eligible(self):
+    def test_more_than_n_days_eligible(self):
         from datetime import datetime, timedelta, timezone
         now = datetime(2026, 8, 4, tzinfo=timezone.utc)
-        scraped = now - timedelta(days=3, seconds=1)
-        with patch.object(db, "get_latest_project_occurrence", return_value={"scraped_at": scraped.isoformat()}):
+        scraped = now - timedelta(days=7, seconds=1)
+        with patch.dict(os.environ, {"OCCURRENCE_WINDOW_DAYS": "7"}, clear=False), \
+             patch.object(db, "get_latest_project_occurrence", return_value={"scraped_at": scraped.isoformat()}):
             ok, reason = db.should_process_project("fintalent", "abc", now=now)
             self.assertTrue(ok)
-            self.assertEqual(reason, "OCCURRENCE_WINDOW_ELAPSED")
+            self.assertTrue(reason.startswith("eligible_after_"))
+
+    def test_window_days_from_env(self):
+        with patch.dict(os.environ, {"OCCURRENCE_WINDOW_DAYS": "5"}, clear=False):
+            os.environ.pop("REPOST_MIN_DAYS", None)
+            self.assertEqual(db.get_occurrence_window_days(), 5)
+        with patch.dict(os.environ, {"REPOST_MIN_DAYS": "10"}, clear=False):
+            os.environ.pop("OCCURRENCE_WINDOW_DAYS", None)
+            self.assertEqual(db.get_occurrence_window_days(), 10)
 
 
 if __name__ == "__main__":

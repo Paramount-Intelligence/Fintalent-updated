@@ -54,6 +54,9 @@ class Config:
     RECIPIENT_EMAILS = [e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()]
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
     MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
+    OCCURRENCE_WINDOW_DAYS = int(
+        os.getenv("OCCURRENCE_WINDOW_DAYS") or os.getenv("REPOST_MIN_DAYS") or "7"
+    )
     HEADLESS = os.getenv("HEADLESS", "True").lower() == "true"
     COOKIES_FILE = "fintalent_cookies.json"
     BASE_URL = BASE_URL
@@ -1119,6 +1122,7 @@ def run_monitor(
     print("=" * 50)
     print(f"  Account   : {Config.FINTALENT_EMAIL}")
     print(f"  Interval  : {Config.CHECK_INTERVAL}s")
+    print(f"  Occurrence: {Config.OCCURRENCE_WINDOW_DAYS} day(s)")
     print(f"  Recipients: {', '.join(Config.RECIPIENT_EMAILS)}")
     print(f"  Dry run   : {dry_run}")
     print()

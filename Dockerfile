@@ -1,8 +1,10 @@
 FROM python:3.11-slim-bookworm
-RUN apt-get update && apt-get install -y \
-    chromium=147.0.7727.137-1~deb12u1 \
-    chromium-common=147.0.7727.137-1~deb12u1 \
-    chromium-driver=147.0.7727.137-1~deb12u1 \
+
+# System deps + Google Chrome (Debian bookworm no longer ships pinned chromium packages)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    gnupg \
+    ca-certificates \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -21,13 +23,20 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxfixes3 \
     libxrandr2 \
+    libxkbcommon0 \
+    libdrm2 \
+    libgbm1 \
+    libxshmfence1 \
     xdg-utils \
-    --no-install-recommends \
-    && apt-mark hold chromium chromium-common chromium-driver \
+    && wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome.deb \
+    && rm -f /tmp/google-chrome.deb \
     && rm -rf /var/lib/apt/lists/*
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+
+ENV CHROME_BIN=/usr/bin/google-chrome
+# Leave CHROMEDRIVER_PATH unset so webdriver-manager matches Chrome at runtime
 ENV HEADLESS=True
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

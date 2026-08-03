@@ -15,7 +15,20 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 PLATFORM = "fintalent"
 SCRAPER_NAME = "fintalent-monitor"
 SCRAPER_VERSION = os.getenv("SCRAPER_VERSION", "2.0.0")
-OCCURRENCE_WINDOW = timedelta(days=3)
+
+
+def get_occurrence_window_days() -> int:
+    """Days between eligible occurrences. Prefer OCCURRENCE_WINDOW_DAYS; fall back to REPOST_MIN_DAYS."""
+    raw = os.getenv("OCCURRENCE_WINDOW_DAYS") or os.getenv("REPOST_MIN_DAYS") or "7"
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        days = 7
+    return max(days, 0)
+
+
+def get_occurrence_window() -> timedelta:
+    return timedelta(days=get_occurrence_window_days())
 
 # Whitelisted columns for detail enrichment updates (never identity / email / scraped_at)
 ENRICHMENT_FIELDS = frozenset({
@@ -323,8 +336,13 @@ def get_latest_project_occurrence(platform: str, project_id: str) -> dict | None
 
 
 def should_process_project(platform: str, project_id: str, now: datetime | None = None) -> tuple[bool, str]:
-    """Three-day occurrence rule using scraped_at only."""
+    """Occurrence rule using scraped_at only. Window from OCCURRENCE_WINDOW_DAYS (or REPOST_MIN_DAYS).
+
+    age > N days → eligible
+    age <= N days → skip
+    """
     now = now or utcnow()
+    window_days = get_occurrence_window_days()
     latest = get_latest_project_occurrence(platform, project_id)
     if not latest:
         return True, "NO_PREVIOUS_OCCURRENCE"
@@ -332,9 +350,9 @@ def should_process_project(platform: str, project_id: str, now: datetime | None 
     if scraped_at is None:
         return True, "MISSING_SCRAPED_AT"
     age = now - scraped_at
-    if age > OCCURRENCE_WINDOW:
-        return True, "OCCURRENCE_WINDOW_ELAPSED"
-    return False, "WITHIN_THREE_DAY_WINDOW"
+    if age > timedelta(days=window_days):
+        return True, f"eligible_after_{age.total_seconds():.0f}s"
+    return False, f"skipped_within_{window_days}_days_age_{age.total_seconds():.0f}s"
 
 
 def insert_project_occurrence(row: dict) -> str:
