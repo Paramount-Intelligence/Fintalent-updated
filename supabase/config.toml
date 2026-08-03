@@ -1,0 +1,7 @@
+project_id = "fintalent-monitor"
+
+[api]
+enabled = true
+
+[db]
+major_version = 15

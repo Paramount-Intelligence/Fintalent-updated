@@ -1,0 +1,8 @@
+[build]
+  builder = "DOCKERFILE"
+  dockerfilePath = "Dockerfile"
+
+[deploy]
+  startCommand = "python -u monitor.py"
+  restartPolicyType = "ALWAYS"
+  restartPolicyMaxRetries = 10

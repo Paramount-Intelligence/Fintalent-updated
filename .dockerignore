@@ -1,0 +1,11 @@
+.env
+*.env
+.git
+.github
+.gitignore
+fintalent_cookies.json
+**/__pycache__/
+*.pyc
+*.pyo
+venv/
+README.md

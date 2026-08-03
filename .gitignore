@@ -1,0 +1,11 @@
+﻿.env
+*.env
+fintalent_cookies.json
+**/__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+_debug_*.txt
+*.log
+.DS_Store
