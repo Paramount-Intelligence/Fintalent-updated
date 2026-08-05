@@ -121,6 +121,47 @@ class TestMonitoringInsertOrder(unittest.TestCase):
         process_scan_cycle(MagicMock(), "run", dry_run=False, send_emails=True)
         self.assertEqual(order, ["insert", "email"])
 
+    @patch("script_clean.send_project_email")
+    @patch("script_clean.fetch_project_details")
+    @patch("script_clean.scan_for_card_extractions")
+    @patch("script_clean.db")
+    def test_detected_at_goes_to_email_not_insert(self, mock_db, mock_scan, mock_fetch, mock_email):
+        """detected_at is an email-template field; projects has no such column."""
+        from script_clean import process_scan_cycle
+        mock_db.should_process_project.return_value = (True, "NO_PREVIOUS_OCCURRENCE")
+        mock_db.verify_lock_held.return_value = True
+        mock_db.renew_worker_lock.return_value = {"renewed": True}
+        mock_db.insert_project_occurrence.return_value = "uuid-new"
+        mock_email.return_value = {"success": True}
+        mock_scan.return_value = [{
+            "ok": True,
+            "card_extraction_status": "COMPLETE",
+            "fields": {
+                "project_id": "n2",
+                "source_url": "https://talent.fintalent.io/brief/n2",
+                "title": "New",
+            },
+            "extraction_metadata": {},
+            "missing_fields": [],
+            "extraction_warnings": [],
+        }]
+        mock_fetch.return_value = {
+            "ok": True,
+            "detail_extraction_status": "COMPLETE",
+            "fields": {"description": "d"},
+            "extraction_metadata": {},
+            "missing_fields": [],
+            "extraction_warnings": [],
+            "detail_failure_code": None,
+        }
+        process_scan_cycle(MagicMock(), "run", dry_run=False, send_emails=True)
+
+        inserted_row = mock_db.insert_project_occurrence.call_args[0][0]
+        self.assertNotIn("detected_at", inserted_row)
+        emailed_row = mock_email.call_args[0][1]
+        self.assertTrue(emailed_row["detected_at"])
+        self.assertEqual(emailed_row["id"], "uuid-new")
+
 
 if __name__ == "__main__":
     unittest.main()

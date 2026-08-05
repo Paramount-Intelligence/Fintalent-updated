@@ -196,6 +196,61 @@ def load_cookies(driver):
         return False
 
 
+_last_lock_heartbeat = 0.0
+
+
+def _lock_heartbeat_interval() -> float:
+    return max(Config.FINTALENT_WORKER_LOCK_TTL_SECONDS / 3.0, 15.0)
+
+
+def heartbeat_worker_lock(*, force: bool = False) -> bool:
+    """Renew the lease at most once per TTL/3. Renewal doubles as ownership proof."""
+    global _last_lock_heartbeat
+    elapsed = time.monotonic() - _last_lock_heartbeat
+    if not force and elapsed < _lock_heartbeat_interval():
+        return True
+    try:
+        result = db.renew_worker_lock(Config.FINTALENT_WORKER_LOCK_TTL_SECONDS)
+    except Exception as e:
+        print(f"  Lock renew error: {e}")
+        return False
+    if result.get("renewed"):
+        _last_lock_heartbeat = time.monotonic()
+        return True
+    return False
+
+
+def ensure_worker_lock() -> bool:
+    """Renew, or re-acquire an expired lease when no other worker has taken it."""
+    global _last_lock_heartbeat
+    if heartbeat_worker_lock(force=True):
+        return True
+    try:
+        lock = db.acquire_worker_lock(Config.FINTALENT_WORKER_LOCK_TTL_SECONDS)
+    except Exception as e:
+        print(f"  Lock re-acquire error: {e}")
+        return False
+    if lock.get("acquired"):
+        _last_lock_heartbeat = time.monotonic()
+        print(f"Worker lock re-acquired as {lock.get('self_owner')}")
+        return True
+    print(f"Worker lock is held by another worker ({lock.get('owner')})")
+    return False
+
+
+def sleep_between_cycles(seconds: float, *, holding_lock: bool) -> None:
+    """Sleep in chunks so an idle interval longer than the lock TTL cannot drop the lease."""
+    deadline = time.monotonic() + seconds
+    chunk = max(min(_lock_heartbeat_interval(), 60.0), 5.0)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(chunk, remaining))
+        if holding_lock:
+            heartbeat_worker_lock(force=True)
+
+
 def clear_session_safe():
     """Clear cookies preserving worker lock; never write saved_at=null."""
     db.delete_scraper_session()
@@ -752,6 +807,8 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
     counts["cards_found"] = len(card_results)
 
     for result in card_results:
+        if not dry_run:
+            heartbeat_worker_lock()
         if not result.get("ok"):
             counts["cards_failed"] += 1
             continue
@@ -838,7 +895,7 @@ def process_scan_cycle(
     counts["cards_found"] = len(card_results)
 
     for result in card_results:
-        if not db.verify_lock_held() and not dry_run:
+        if not dry_run and not heartbeat_worker_lock():
             print("  Worker lock lost — stopping scan processing")
             counts["partial_failures"] = True
             break
@@ -912,7 +969,8 @@ def process_scan_cycle(
             missing_fields=list(set((result.get("missing_fields") or []) + (detail.get("missing_fields") or []))),
             extraction_warnings=list(set((result.get("extraction_warnings") or []) + (detail.get("extraction_warnings") or []))),
         )
-        row["detected_at"] = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
+        # detected_at is an email-template value only; projects has no such column
+        detected_at = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
 
         if dry_run:
             print(f"  [dry-run] would insert + email={email_status} for {project_id}")
@@ -932,7 +990,10 @@ def process_scan_cycle(
                 print("  Lock lost before email — leaving PENDING")
                 counts["partial_failures"] = True
                 continue
-            email_result = send_project_email(project_uuid, {**row, "id": project_uuid})
+            email_result = send_project_email(
+                project_uuid,
+                {**row, "id": project_uuid, "detected_at": detected_at},
+            )
             if email_result.get("success"):
                 counts["emails_sent"] += 1
             else:
@@ -941,13 +1002,8 @@ def process_scan_cycle(
         elif email_status == "NOT_REQUIRED":
             pass
 
-        try:
-            renewed = db.renew_worker_lock(Config.FINTALENT_WORKER_LOCK_TTL_SECONDS)
-            if not renewed.get("renewed"):
-                print("  Lock renew failed")
-                counts["partial_failures"] = True
-                break
-        except Exception:
+        if not heartbeat_worker_lock(force=True):
+            print("  Lock renew failed")
             counts["partial_failures"] = True
             break
 
@@ -1137,6 +1193,8 @@ def run_monitor(
             print(f"Could not acquire worker lock (held by {lock.get('owner')}). Exiting.")
             return 2
         lock_acquired = True
+        global _last_lock_heartbeat
+        _last_lock_heartbeat = time.monotonic()
         print(f"Worker lock acquired as {lock.get('self_owner')}")
     elif dry_run:
         print("Dry run: skipping worker lock and all writes")
@@ -1162,12 +1220,10 @@ def run_monitor(
                 run_id = db.create_scraper_run(metadata={"check": check_count})
 
             try:
-                if not dry_run:
-                    renewed = db.renew_worker_lock(Config.FINTALENT_WORKER_LOCK_TTL_SECONDS)
-                    if not renewed.get("renewed") and lock_acquired:
-                        db.fail_scraper_run(run_id, failure_code="LOCK_LOST", failure_reason="Failed to renew lock")
-                        print("Lock lost — aborting")
-                        return 2
+                if not dry_run and lock_acquired and not ensure_worker_lock():
+                    db.fail_scraper_run(run_id, failure_code="LOCK_LOST", failure_reason="Failed to renew lock")
+                    print("Lock lost — aborting")
+                    return 2
 
                 driver.get(Config.TARGET_URL)
                 time.sleep(4)
@@ -1181,7 +1237,10 @@ def run_monitor(
                             )
                         if run_once:
                             return 1
-                        time.sleep(Config.CHECK_INTERVAL)
+                        sleep_between_cycles(
+                            Config.CHECK_INTERVAL,
+                            holding_lock=lock_acquired and not dry_run,
+                        )
                         continue
                     driver.get(Config.TARGET_URL)
                     time.sleep(4)
@@ -1271,7 +1330,7 @@ def run_monitor(
             if run_once:
                 print("\nOnce mode complete. Exiting...")
                 break
-            time.sleep(Config.CHECK_INTERVAL)
+            sleep_between_cycles(Config.CHECK_INTERVAL, holding_lock=lock_acquired and not dry_run)
 
     except KeyboardInterrupt:
         print("\nMonitor stopped by user.")

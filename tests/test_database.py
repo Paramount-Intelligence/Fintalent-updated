@@ -63,6 +63,53 @@ class TestMongoAbsentFromRuntime(unittest.TestCase):
             self.assertNotIn("MONGO_URI", text)
 
 
+class TestInsertUnknownColumnRecovery(unittest.TestCase):
+    """PGRST204 on one stray key must not fail the whole occurrence."""
+
+    def _client(self, unknown_columns):
+        seen = []
+        mock_sb = MagicMock()
+
+        def insert(payload):
+            seen.append(dict(payload))
+            offending = next((c for c in unknown_columns if c in payload), None)
+            builder = MagicMock()
+            if offending:
+                builder.select.return_value.execute.side_effect = RuntimeError(
+                    f"{{'message': \"Could not find the '{offending}' column of 'projects' "
+                    "in the schema cache\", 'code': 'PGRST204'}"
+                )
+            else:
+                builder.select.return_value.execute.return_value = MagicMock(data=[{"id": "uuid-1"}])
+            return builder
+
+        mock_sb.table.return_value.insert.side_effect = insert
+        return mock_sb, seen
+
+    def test_unknown_column_dropped_and_insert_retried(self):
+        mock_sb, seen = self._client({"detected_at"})
+        with patch.object(db, "get_supabase_client", return_value=mock_sb):
+            uuid = db.insert_project_occurrence({
+                "project_id": "p1",
+                "title": "T",
+                "detected_at": "2026-08-05 20:44:00",
+            })
+        self.assertEqual(uuid, "uuid-1")
+        self.assertEqual(len(seen), 2)
+        self.assertIn("detected_at", seen[0])
+        self.assertNotIn("detected_at", seen[1])
+        self.assertEqual(seen[1]["project_id"], "p1")
+
+    def test_unrelated_error_still_raises(self):
+        mock_sb = MagicMock()
+        mock_sb.table.return_value.insert.return_value.select.return_value.execute.side_effect = (
+            RuntimeError("network boom")
+        )
+        with patch.object(db, "get_supabase_client", return_value=mock_sb):
+            with self.assertRaises(db.DatabaseError):
+                db.insert_project_occurrence({"project_id": "p1"})
+
+
 class TestOccurrenceHelpers(unittest.TestCase):
     def test_should_process_first_occurrence(self):
         with patch.object(db, "get_latest_project_occurrence", return_value=None):

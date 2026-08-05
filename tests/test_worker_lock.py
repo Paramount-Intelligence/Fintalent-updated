@@ -42,5 +42,76 @@ class TestWorkerLockRPC(unittest.TestCase):
             self.assertFalse(db.verify_lock_held())
 
 
+class TestLockHeartbeat(unittest.TestCase):
+    def setUp(self):
+        import script_clean
+        self.script_clean = script_clean
+        script_clean._last_lock_heartbeat = 0.0
+
+    def test_heartbeat_throttles_after_success(self):
+        sc = self.script_clean
+        with patch.object(sc, "db") as mock_db:
+            mock_db.renew_worker_lock.return_value = {"renewed": True}
+            self.assertTrue(sc.heartbeat_worker_lock())
+            self.assertTrue(sc.heartbeat_worker_lock())
+            self.assertEqual(mock_db.renew_worker_lock.call_count, 1)
+            self.assertTrue(sc.heartbeat_worker_lock(force=True))
+            self.assertEqual(mock_db.renew_worker_lock.call_count, 2)
+
+    def test_heartbeat_false_when_not_renewed(self):
+        sc = self.script_clean
+        with patch.object(sc, "db") as mock_db:
+            mock_db.renew_worker_lock.return_value = {"renewed": False}
+            self.assertFalse(sc.heartbeat_worker_lock())
+
+    def test_ensure_lock_reacquires_expired_lease(self):
+        sc = self.script_clean
+        with patch.object(sc, "db") as mock_db:
+            mock_db.renew_worker_lock.return_value = {"renewed": False}
+            mock_db.acquire_worker_lock.return_value = {"acquired": True, "self_owner": "me"}
+            self.assertTrue(sc.ensure_worker_lock())
+            mock_db.acquire_worker_lock.assert_called_once()
+
+    def test_ensure_lock_fails_when_another_worker_holds_it(self):
+        sc = self.script_clean
+        with patch.object(sc, "db") as mock_db:
+            mock_db.renew_worker_lock.return_value = {"renewed": False}
+            mock_db.acquire_worker_lock.return_value = {"acquired": False, "owner": "other"}
+            self.assertFalse(sc.ensure_worker_lock())
+
+    def _fake_clock(self):
+        """sleep() advances a virtual monotonic clock so idle waits run instantly."""
+        state = {"now": 1000.0, "slept": []}
+
+        def sleep(seconds):
+            state["slept"].append(seconds)
+            state["now"] += seconds
+
+        return state, sleep
+
+    def test_idle_interval_longer_than_ttl_keeps_renewing(self):
+        sc = self.script_clean
+        state, sleep = self._fake_clock()
+        with patch.object(sc, "db") as mock_db, \
+             patch.object(sc.time, "sleep", side_effect=sleep), \
+             patch.object(sc.time, "monotonic", side_effect=lambda: state["now"]), \
+             patch.object(sc.Config, "FINTALENT_WORKER_LOCK_TTL_SECONDS", 180):
+            mock_db.renew_worker_lock.return_value = {"renewed": True}
+            sc.sleep_between_cycles(600, holding_lock=True)
+            self.assertEqual(sum(state["slept"]), 600)
+            self.assertLessEqual(max(state["slept"]), 60)
+            self.assertGreaterEqual(mock_db.renew_worker_lock.call_count, 10)
+
+    def test_idle_interval_without_lock_does_not_renew(self):
+        sc = self.script_clean
+        state, sleep = self._fake_clock()
+        with patch.object(sc, "db") as mock_db, \
+             patch.object(sc.time, "sleep", side_effect=sleep), \
+             patch.object(sc.time, "monotonic", side_effect=lambda: state["now"]):
+            sc.sleep_between_cycles(120, holding_lock=False)
+            self.assertEqual(sum(state["slept"]), 120)
+            mock_db.renew_worker_lock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

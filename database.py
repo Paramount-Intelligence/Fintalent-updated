@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -355,6 +356,9 @@ def should_process_project(platform: str, project_id: str, now: datetime | None 
     return False, f"skipped_within_{window_days}_days_age_{age.total_seconds():.0f}s"
 
 
+_UNKNOWN_COLUMN_RE = re.compile(r"Could not find the '([^']+)' column")
+
+
 def insert_project_occurrence(row: dict) -> str:
     sb = get_supabase_client()
     payload = dict(row)
@@ -364,10 +368,28 @@ def insert_project_occurrence(row: dict) -> str:
     payload.setdefault("last_seen_at", payload["scraped_at"])
     payload.setdefault("created_at", _iso())
     payload.setdefault("updated_at", _iso())
-    res = _execute(
-        sb.table("projects").insert(payload).select("id"),
-        context="insert_project_occurrence",
-    )
+
+    dropped: list[str] = []
+    # A key absent from the shared schema must not cost the whole occurrence.
+    for _ in range(len(payload)):
+        try:
+            res = _execute(
+                sb.table("projects").insert(payload).select("id"),
+                context="insert_project_occurrence",
+            )
+            break
+        except DatabaseError as e:
+            match = _UNKNOWN_COLUMN_RE.search(str(e))
+            column = match.group(1) if match else None
+            if not column or column not in payload:
+                raise
+            payload.pop(column)
+            dropped.append(column)
+    else:
+        raise DatabaseError("insert_project_occurrence exhausted retries", code="INSERT_FAILED")
+
+    if dropped:
+        print(f"  Warning: dropped unknown projects column(s) {', '.join(dropped)}")
     if not res.data or not res.data[0].get("id"):
         raise DatabaseError("insert_project_occurrence returned no id", code="INSERT_FAILED")
     return res.data[0]["id"]
