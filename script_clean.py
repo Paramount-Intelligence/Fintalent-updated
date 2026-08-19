@@ -70,6 +70,7 @@ class Config:
     DETAIL_RETRY_COOLDOWN_MINUTES = int(os.getenv("DETAIL_RETRY_COOLDOWN_MINUTES", "360"))
     FINTALENT_WORKER_LOCK_TTL_SECONDS = int(os.getenv("FINTALENT_WORKER_LOCK_TTL_SECONDS", "180"))
     ERROR_EMAIL_COOLDOWN_MINUTES = int(os.getenv("ERROR_EMAIL_COOLDOWN_MINUTES", "360"))
+    ERROR_RECIPIENT_EMAIL = os.getenv("ERROR_RECIPIENT_EMAIL", "").strip()
 
 
 def validate_config(*, require_smtp: bool = True, require_fintalent: bool = True) -> None:
@@ -683,6 +684,35 @@ def classify_email_failure(exc: Exception) -> str:
     return "SMTP_SEND_FAILED"
 
 
+_last_error_email_at: float = 0.0
+
+
+def send_error_email(subject: str, body: str) -> None:
+    """Send an error notification to ERROR_RECIPIENT_EMAIL. Respects cooldown."""
+    global _last_error_email_at
+    recipient = Config.ERROR_RECIPIENT_EMAIL
+    if not recipient:
+        return
+    elapsed_min = (time.monotonic() - _last_error_email_at) / 60.0
+    if _last_error_email_at > 0 and elapsed_min < Config.ERROR_EMAIL_COOLDOWN_MINUTES:
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"[FinTalent Monitor ERROR] {subject}"
+        msg["From"] = Config.SENDER_EMAIL
+        msg["To"] = recipient
+        html = f"<html><body><h3>{_esc(subject)}</h3><pre>{_esc(body[:5000])}</pre></body></html>"
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
+            server.sendmail(Config.SENDER_EMAIL, [recipient], msg.as_string())
+        _last_error_email_at = time.monotonic()
+        print(f"  Error email sent to {recipient}: {subject[:60]}")
+    except Exception as e:
+        print(f"  Failed to send error email: {e}")
+
+
 def send_notification(project) -> dict:
     """Return structured email result (never bare True/False)."""
     try:
@@ -802,7 +832,7 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
         "emails_sent": 0, "emails_failed": 0, "emails_suppressed": 0,
         "persistence_failed": False,
     }
-    print("Cold start: seeding FinTalent projects with detail enrichment (emails suppressed)...")
+    print("Cold start: seeding FinTalent projects with detail enrichment...")
     card_results = scan_for_card_extractions(driver, debug=debug_extraction)
     counts["cards_found"] = len(card_results)
 
@@ -849,25 +879,36 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
             scraper_run_id=run_id,
             card_status=result.get("card_extraction_status") or "COMPLETE",
             detail_status=detail.get("detail_extraction_status") or "FAILED",
-            email_eligible=False,
-            email_status="SUPPRESSED",
+            email_eligible=True,
+            email_status="PENDING",
             email_sent=False,
-            email_not_sent_reason="COLD_START_SEED",
+            email_not_sent_reason=None,
             detail_failure_code=detail.get("detail_failure_code"),
             missing_fields=list(set((result.get("missing_fields") or []) + (detail.get("missing_fields") or []))),
             extraction_warnings=list(set((result.get("extraction_warnings") or []) + (detail.get("extraction_warnings") or []))),
         )
-        counts["emails_suppressed"] += 1
 
         if dry_run:
             print(f"  [dry-run] would insert seed {row['project_id']}")
             continue
         try:
-            db.insert_project_occurrence(row)
+            project_uuid = db.insert_project_occurrence(row)
             counts["projects_inserted"] += 1
         except Exception as e:
             print(f"  Persistence failed for {row.get('project_id')}: {e}")
+            send_error_email(f"Cold start insert failed: {row.get('project_id')}", str(e))
             counts["persistence_failed"] = True
+            continue
+
+        detected_at = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
+        email_result = send_project_email(
+            project_uuid,
+            {**row, "id": project_uuid, "detected_at": detected_at},
+        )
+        if email_result.get("success"):
+            counts["emails_sent"] += 1
+        else:
+            counts["emails_failed"] += 1
 
     if counts["persistence_failed"] and counts["projects_inserted"] == 0 and not dry_run:
         raise db.DatabaseError("Cold start persistence failed for all projects", code="COLD_START_PERSIST_FAILED")
@@ -981,6 +1022,7 @@ def process_scan_cycle(
             counts["projects_inserted"] += 1
         except Exception as e:
             print(f"  DB insert failed: {e}")
+            send_error_email(f"DB insert failed for {project_id}", str(e))
             counts["db_failed"] = True
             counts["partial_failures"] = True
             continue
@@ -1203,6 +1245,7 @@ def run_monitor(
     try:
         if not setup_session(driver):
             print("Failed to authenticate FinTalent session.")
+            send_error_email("Authentication failed", "Could not log in to FinTalent. Check credentials.")
             if not dry_run:
                 run_id = db.create_scraper_run(metadata={"phase": "auth"})
                 db.fail_scraper_run(run_id, failure_code="AUTH_FAILED", failure_reason="Login failed", status="AUTH_FAILED")
@@ -1223,6 +1266,7 @@ def run_monitor(
                 if not dry_run and lock_acquired and not ensure_worker_lock():
                     db.fail_scraper_run(run_id, failure_code="LOCK_LOST", failure_reason="Failed to renew lock")
                     print("Lock lost — aborting")
+                    send_error_email("Worker lock lost", "Another instance may have taken over. Exiting.")
                     return 2
 
                 driver.get(Config.TARGET_URL)
@@ -1307,12 +1351,14 @@ def run_monitor(
 
             except db.DatabaseError as e:
                 print(f"Database error: {e}")
+                send_error_email(f"Database error: {e.code}", str(e))
                 if run_id:
                     db.fail_scraper_run(run_id, failure_code=e.code, failure_reason=str(e))
                 if run_once:
                     return 1
             except Exception as e:
                 print(f"Check cycle failed: {e}. Reinitializing driver...")
+                send_error_email(f"Check cycle exception: {type(e).__name__}", traceback.format_exc()[-3000:])
                 traceback.print_exc()
                 if run_id:
                     try:
