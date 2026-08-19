@@ -71,6 +71,7 @@ class Config:
     FINTALENT_WORKER_LOCK_TTL_SECONDS = int(os.getenv("FINTALENT_WORKER_LOCK_TTL_SECONDS", "180"))
     ERROR_EMAIL_COOLDOWN_MINUTES = int(os.getenv("ERROR_EMAIL_COOLDOWN_MINUTES", "360"))
     ERROR_RECIPIENT_EMAIL = os.getenv("ERROR_RECIPIENT_EMAIL", "").strip()
+    SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN = os.getenv("SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN", "false").lower() == "true"
 
 
 def validate_config(*, require_smtp: bool = True, require_fintalent: bool = True) -> None:
@@ -874,15 +875,16 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
                 "meta": merged.get("extraction_metadata"),
             }, default=str, indent=2)[:2000])
 
+        suppress = Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN
         row = build_project_row(
             merged,
             scraper_run_id=run_id,
             card_status=result.get("card_extraction_status") or "COMPLETE",
             detail_status=detail.get("detail_extraction_status") or "FAILED",
-            email_eligible=True,
-            email_status="PENDING",
+            email_eligible=not suppress,
+            email_status="SUPPRESSED" if suppress else "PENDING",
             email_sent=False,
-            email_not_sent_reason=None,
+            email_not_sent_reason="COLD_START_SUPPRESSED" if suppress else None,
             detail_failure_code=detail.get("detail_failure_code"),
             missing_fields=list(set((result.get("missing_fields") or []) + (detail.get("missing_fields") or []))),
             extraction_warnings=list(set((result.get("extraction_warnings") or []) + (detail.get("extraction_warnings") or []))),
@@ -900,15 +902,18 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
             counts["persistence_failed"] = True
             continue
 
-        detected_at = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
-        email_result = send_project_email(
-            project_uuid,
-            {**row, "id": project_uuid, "detected_at": detected_at},
-        )
-        if email_result.get("success"):
-            counts["emails_sent"] += 1
+        if suppress:
+            counts["emails_suppressed"] += 1
         else:
-            counts["emails_failed"] += 1
+            detected_at = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
+            email_result = send_project_email(
+                project_uuid,
+                {**row, "id": project_uuid, "detected_at": detected_at},
+            )
+            if email_result.get("success"):
+                counts["emails_sent"] += 1
+            else:
+                counts["emails_failed"] += 1
 
     if counts["persistence_failed"] and counts["projects_inserted"] == 0 and not dry_run:
         raise db.DatabaseError("Cold start persistence failed for all projects", code="COLD_START_PERSIST_FAILED")
