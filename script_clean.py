@@ -55,7 +55,6 @@ class Config:
     SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
     RECIPIENT_EMAILS = [e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()]
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
-    MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", 60))
     OCCURRENCE_WINDOW_DAYS = int(
         os.getenv("OCCURRENCE_WINDOW_DAYS") or os.getenv("REPOST_MIN_DAYS") or "7"
     )
@@ -978,25 +977,6 @@ def send_project_email(project_uuid: str, project_row: dict, *, attempt_number: 
     return result
 
 
-def within_notification_age(merged: dict) -> bool:
-    """MAX_AGE_MINUTES is email policy only — never blocks storage."""
-    posted = merged.get("source_posted_at")
-    if not posted:
-        return True  # unknown age → allow email eligibility decision by caller
-    try:
-        if isinstance(posted, str):
-            posted = posted.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(posted)
-        else:
-            dt = posted
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age_min = (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
-        return age_min <= Config.MAX_AGE_MINUTES
-    except Exception:
-        return True
-
-
 # ============================
 # COLD START / SCAN CYCLE
 # ============================
@@ -1159,21 +1139,17 @@ def process_scan_cycle(
                 "meta": merged.get("extraction_metadata"),
             }, default=str, indent=2)[:2500])
 
-        notify_ok = within_notification_age(merged)
+        # Occurrence window (OCCURRENCE_WINDOW_DAYS) is the only skip rule;
+        # every eligible new occurrence is emailed unless first-run suppress applies.
         if force_suppress_emails:
             email_eligible = False
             email_status = "SUPPRESSED"
             email_reason = "FIRST_RUN_SEED"
             counts["emails_suppressed"] += 1
-        elif notify_ok:
+        else:
             email_eligible = True
             email_status = "PENDING"
             email_reason = None
-        else:
-            email_eligible = False
-            email_status = "NOT_REQUIRED"
-            email_reason = "OUTSIDE_NOTIFICATION_AGE_WINDOW"
-            counts["emails_suppressed"] += 1
 
         row = build_project_row(
             merged,
@@ -1223,8 +1199,6 @@ def process_scan_cycle(
             else:
                 counts["emails_failed"] += 1
                 counts["partial_failures"] = True
-        elif email_status == "NOT_REQUIRED":
-            pass
 
         if not heartbeat_worker_lock(force=True):
             print("  Lock renew failed")
