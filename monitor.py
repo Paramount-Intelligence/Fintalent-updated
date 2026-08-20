@@ -50,7 +50,7 @@ def cmd_test_supabase():
 
 
 def cmd_test_login():
-    from script_clean import Config, initialize_driver, setup_session, validate_config
+    from script_clean import Config, initialize_driver, setup_session, validate_config, safe_quit_driver
     validate_config(require_smtp=False)
     driver = initialize_driver()
     try:
@@ -58,7 +58,7 @@ def cmd_test_login():
         print(f"Login {'OK' if ok else 'FAILED'} url={driver.current_url}")
         return 0 if ok else 1
     finally:
-        driver.quit()
+        safe_quit_driver(driver)
 
 
 def cmd_test_session_clear():

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import smtplib
+import subprocess
 import sys
 import time
 import traceback
@@ -69,9 +71,16 @@ class Config:
     DETAIL_MAX_AUTOMATIC_ATTEMPTS = int(os.getenv("DETAIL_MAX_AUTOMATIC_ATTEMPTS", "3"))
     DETAIL_RETRY_COOLDOWN_MINUTES = int(os.getenv("DETAIL_RETRY_COOLDOWN_MINUTES", "360"))
     FINTALENT_WORKER_LOCK_TTL_SECONDS = int(os.getenv("FINTALENT_WORKER_LOCK_TTL_SECONDS", "180"))
-    ERROR_EMAIL_COOLDOWN_MINUTES = int(os.getenv("ERROR_EMAIL_COOLDOWN_MINUTES", "360"))
     ERROR_RECIPIENT_EMAIL = os.getenv("ERROR_RECIPIENT_EMAIL", "").strip()
+    # 0 = no cooldown / no cap (email every operational failure)
+    ERROR_EMAIL_COOLDOWN_MINUTES = int(os.getenv("ERROR_EMAIL_COOLDOWN_MINUTES", "0"))
+    INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD = int(os.getenv("INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD", "1"))
+    INCIDENT_OPEN_AFTER_MINUTES = int(os.getenv("INCIDENT_OPEN_AFTER_MINUTES", "0"))
+    INCIDENT_REMINDER_HOURS = int(os.getenv("INCIDENT_REMINDER_HOURS", "0"))
+    INCIDENT_MAX_EMAILS = int(os.getenv("INCIDENT_MAX_EMAILS", "0"))
+    PLATFORM_MAX_ERROR_EMAILS_PER_DAY = int(os.getenv("PLATFORM_MAX_ERROR_EMAILS_PER_DAY", "0"))
     SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN = os.getenv("SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN", "false").lower() == "true"
+    PROCESS_RECYCLE_HOURS = float(os.getenv("PROCESS_RECYCLE_HOURS", "3"))
 
 
 def validate_config(*, require_smtp: bool = True, require_fintalent: bool = True) -> None:
@@ -93,6 +102,104 @@ def validate_config(*, require_smtp: bool = True, require_fintalent: bool = True
             missing.append("RECIPIENT_EMAILS")
     if missing:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
+
+
+# ============================
+# BROWSER PROCESS HYGIENE
+# ============================
+
+_BROWSER_NAME_RE = (
+    "chrome|chromium|chromedriver|google-chrome|crashpad|chrome_crashpad"
+)
+
+
+def is_browser_process_exhaustion(exc: BaseException | str) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "cannot fork",
+        "posix_spawn",
+        "resource temporarily unavailable",
+        "too many open files",
+        "unable to create process",
+        "failed to create process",
+    )
+    return any(n in msg for n in needles)
+
+
+def classify_operational_failure(exc: BaseException) -> str:
+    if is_browser_process_exhaustion(exc):
+        return "BROWSER_PROCESS_EXHAUSTION"
+    return "SCAN_EXCEPTION"
+
+
+def reap_browser_leftovers(*, reason: str = "") -> int:
+    """Best-effort kill of leaked Chromium / ChromeDriver / crashpad processes."""
+    killed = 0
+    if os.name == "nt":
+        for image in ("chrome.exe", "chromedriver.exe", "crashpad_handler.exe"):
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/F", "/IM", image, "/T"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if r.returncode == 0:
+                    killed += 1
+            except Exception:
+                pass
+    else:
+        # Prefer pkill pattern match; ignore "no process" exit codes.
+        try:
+            r = subprocess.run(
+                ["pkill", "-9", "-f", _BROWSER_NAME_RE],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode in (0, 1):
+                killed = 0 if r.returncode == 1 else 1
+        except FileNotFoundError:
+            try:
+                r = subprocess.run(
+                    ["ps", "-eo", "pid,comm,args"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                for line in (r.stdout or "").splitlines():
+                    low = line.lower()
+                    if not any(tok in low for tok in ("chrome", "chromium", "chromedriver", "crashpad")):
+                        continue
+                    if "pkill" in low or "reap_browser" in low:
+                        continue
+                    try:
+                        pid = int(line.split(None, 1)[0])
+                        if pid == os.getpid():
+                            continue
+                        os.kill(pid, signal.SIGKILL)
+                        killed += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if reason:
+        print(f"  Reaped browser leftovers ({reason}); signals_sent≈{killed}")
+    return killed
+
+
+def safe_quit_driver(driver) -> None:
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception as e:
+        print(f"  Warning quitting driver: {e}")
+    finally:
+        reap_browser_leftovers(reason="after driver.quit")
+
+
+def process_recycle_due(started_at: float) -> bool:
+    hours = Config.PROCESS_RECYCLE_HOURS
+    if hours <= 0:
+        return False
+    return (time.monotonic() - started_at) >= (hours * 3600.0)
 
 
 def debug_print(msg, enabled=False):
@@ -408,6 +515,7 @@ def _find_binary(env_var, candidates):
 
 
 def initialize_driver():
+    reap_browser_leftovers(reason="before browser start")
     options = Options()
     if Config.HEADLESS:
         options.add_argument("--headless=new")
@@ -449,7 +557,13 @@ def initialize_driver():
         except Exception:
             service = Service()
 
-    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        if is_browser_process_exhaustion(e):
+            reap_browser_leftovers(reason="BROWSER_PROCESS_EXHAUSTION on start")
+            raise RuntimeError(f"BROWSER_PROCESS_EXHAUSTION: {e}") from e
+        raise
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {
         "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     })
@@ -686,17 +800,77 @@ def classify_email_failure(exc: Exception) -> str:
 
 
 _last_error_email_at: float = 0.0
+_error_emails_sent_today: int = 0
+_error_emails_day_key: str = ""
+_incident_email_counts: dict[str, int] = {}
+_incident_first_seen: dict[str, float] = {}
+_incident_consecutive: dict[str, int] = {}
+_first_scan_pending: bool = True
 
 
-def send_error_email(subject: str, body: str) -> None:
-    """Send an error notification to ERROR_RECIPIENT_EMAIL. Respects cooldown."""
-    global _last_error_email_at
+def _utc_day_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _error_caps_allow(incident_key: str) -> tuple[bool, str]:
+    """Return (allowed, skip_reason). 0 means unlimited for max caps."""
+    global _error_emails_sent_today, _error_emails_day_key
+
+    day = _utc_day_key()
+    if day != _error_emails_day_key:
+        _error_emails_day_key = day
+        _error_emails_sent_today = 0
+
+    daily_cap = Config.PLATFORM_MAX_ERROR_EMAILS_PER_DAY
+    if daily_cap > 0 and _error_emails_sent_today >= daily_cap:
+        return False, "PLATFORM_DAILY_EMAIL_LIMIT_REACHED"
+
+    consecutive = _incident_consecutive.get(incident_key, 0) + 1
+    _incident_consecutive[incident_key] = consecutive
+    if consecutive < max(Config.INCIDENT_CONSECUTIVE_FAILURE_THRESHOLD, 1):
+        return False, "BELOW_CONSECUTIVE_FAILURE_THRESHOLD"
+
+    first = _incident_first_seen.setdefault(incident_key, time.monotonic())
+    open_after = Config.INCIDENT_OPEN_AFTER_MINUTES
+    if open_after > 0 and ((time.monotonic() - first) / 60.0) < open_after:
+        return False, "INCIDENT_NOT_OPEN_YET"
+
+    sent = _incident_email_counts.get(incident_key, 0)
+    max_emails = Config.INCIDENT_MAX_EMAILS
+    if max_emails > 0 and sent >= max_emails:
+        return False, "INCIDENT_EMAIL_LIMIT_REACHED"
+
+    # Reminder spacing: only applies after the first email for this incident
+    reminder_h = Config.INCIDENT_REMINDER_HOURS
+    if reminder_h > 0 and sent > 0 and _last_error_email_at > 0:
+        if (time.monotonic() - _last_error_email_at) < (reminder_h * 3600.0):
+            return False, "INCIDENT_REMINDER_COOLDOWN"
+
+    cooldown = Config.ERROR_EMAIL_COOLDOWN_MINUTES
+    if cooldown > 0 and _last_error_email_at > 0:
+        if ((time.monotonic() - _last_error_email_at) / 60.0) < cooldown:
+            return False, "ERROR_EMAIL_COOLDOWN"
+
+    return True, ""
+
+
+def send_error_email(subject: str, body: str, *, incident_key: str | None = None) -> None:
+    """Send an operational error to ERROR_RECIPIENT_EMAIL. Caps default to unlimited (0)."""
+    global _last_error_email_at, _error_emails_sent_today
     recipient = Config.ERROR_RECIPIENT_EMAIL
     if not recipient:
+        print(f"  ERROR_RECIPIENT_EMAIL unset — skipping error email: {subject[:60]}")
         return
-    elapsed_min = (time.monotonic() - _last_error_email_at) / 60.0
-    if _last_error_email_at > 0 and elapsed_min < Config.ERROR_EMAIL_COOLDOWN_MINUTES:
+    if not Config.SENDER_EMAIL or not Config.SENDER_PASSWORD:
+        print(f"  SMTP unset — skipping error email: {subject[:60]}")
         return
+
+    key = incident_key or subject[:120]
+    allowed, skip = _error_caps_allow(key)
+    if not allowed:
+        print(f"  Error email skipped ({skip}): {subject[:60]}")
+        return
+
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"[FinTalent Monitor ERROR] {subject}"
@@ -709,6 +883,8 @@ def send_error_email(subject: str, body: str) -> None:
             server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
             server.sendmail(Config.SENDER_EMAIL, [recipient], msg.as_string())
         _last_error_email_at = time.monotonic()
+        _error_emails_sent_today += 1
+        _incident_email_counts[key] = _incident_email_counts.get(key, 0) + 1
         print(f"  Error email sent to {recipient}: {subject[:60]}")
     except Exception as e:
         print(f"  Failed to send error email: {e}")
@@ -833,7 +1009,7 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
         "emails_sent": 0, "emails_failed": 0, "emails_suppressed": 0,
         "persistence_failed": False,
     }
-    print("Cold start: seeding FinTalent projects with detail enrichment...")
+    print("Cold start: seeding FinTalent projects with detail enrichment (emails suppressed)...")
     card_results = scan_for_card_extractions(driver, debug=debug_extraction)
     counts["cards_found"] = len(card_results)
 
@@ -875,16 +1051,16 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
                 "meta": merged.get("extraction_metadata"),
             }, default=str, indent=2)[:2000])
 
-        suppress = Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN
+        # True cold start (empty platform table): always suppress project emails.
         row = build_project_row(
             merged,
             scraper_run_id=run_id,
             card_status=result.get("card_extraction_status") or "COMPLETE",
             detail_status=detail.get("detail_extraction_status") or "FAILED",
-            email_eligible=not suppress,
-            email_status="SUPPRESSED" if suppress else "PENDING",
+            email_eligible=False,
+            email_status="SUPPRESSED",
             email_sent=False,
-            email_not_sent_reason="COLD_START_SUPPRESSED" if suppress else None,
+            email_not_sent_reason="COLD_START_SEED",
             detail_failure_code=detail.get("detail_failure_code"),
             missing_fields=list(set((result.get("missing_fields") or []) + (detail.get("missing_fields") or []))),
             extraction_warnings=list(set((result.get("extraction_warnings") or []) + (detail.get("extraction_warnings") or []))),
@@ -894,26 +1070,17 @@ def process_cold_start(driver, run_id: str, *, dry_run: bool = False, debug_extr
             print(f"  [dry-run] would insert seed {row['project_id']}")
             continue
         try:
-            project_uuid = db.insert_project_occurrence(row)
+            db.insert_project_occurrence(row)
             counts["projects_inserted"] += 1
+            counts["emails_suppressed"] += 1
         except Exception as e:
             print(f"  Persistence failed for {row.get('project_id')}: {e}")
-            send_error_email(f"Cold start insert failed: {row.get('project_id')}", str(e))
-            counts["persistence_failed"] = True
-            continue
-
-        if suppress:
-            counts["emails_suppressed"] += 1
-        else:
-            detected_at = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S")
-            email_result = send_project_email(
-                project_uuid,
-                {**row, "id": project_uuid, "detected_at": detected_at},
+            send_error_email(
+                f"Cold start insert failed: {row.get('project_id')}",
+                str(e),
+                incident_key="cold_start_insert",
             )
-            if email_result.get("success"):
-                counts["emails_sent"] += 1
-            else:
-                counts["emails_failed"] += 1
+            counts["persistence_failed"] = True
 
     if counts["persistence_failed"] and counts["projects_inserted"] == 0 and not dry_run:
         raise db.DatabaseError("Cold start persistence failed for all projects", code="COLD_START_PERSIST_FAILED")
@@ -927,6 +1094,7 @@ def process_scan_cycle(
     dry_run: bool = False,
     debug_extraction: bool = False,
     send_emails: bool = True,
+    force_suppress_emails: bool = False,
 ) -> dict:
     counts = {
         "cards_found": 0, "cards_parsed": 0, "cards_failed": 0,
@@ -992,7 +1160,12 @@ def process_scan_cycle(
             }, default=str, indent=2)[:2500])
 
         notify_ok = within_notification_age(merged)
-        if notify_ok:
+        if force_suppress_emails:
+            email_eligible = False
+            email_status = "SUPPRESSED"
+            email_reason = "FIRST_RUN_SEED"
+            counts["emails_suppressed"] += 1
+        elif notify_ok:
             email_eligible = True
             email_status = "PENDING"
             email_reason = None
@@ -1027,7 +1200,11 @@ def process_scan_cycle(
             counts["projects_inserted"] += 1
         except Exception as e:
             print(f"  DB insert failed: {e}")
-            send_error_email(f"DB insert failed for {project_id}", str(e))
+            send_error_email(
+                f"DB insert failed for {project_id}",
+                str(e),
+                incident_key="db_insert",
+            )
             counts["db_failed"] = True
             counts["partial_failures"] = True
             continue
@@ -1220,6 +1397,9 @@ def run_monitor(
     debug_extraction=False,
     skip_lock=False,
 ):
+    global _first_scan_pending, _last_lock_heartbeat
+
+    process_started_at = time.monotonic()
     print("=" * 50)
     print("FinTalent Project Monitor")
     print("=" * 50)
@@ -1227,6 +1407,9 @@ def run_monitor(
     print(f"  Interval  : {Config.CHECK_INTERVAL}s")
     print(f"  Occurrence: {Config.OCCURRENCE_WINDOW_DAYS} day(s)")
     print(f"  Recipients: {', '.join(Config.RECIPIENT_EMAILS)}")
+    print(f"  Error to  : {Config.ERROR_RECIPIENT_EMAIL or '(unset)'}")
+    print(f"  Recycle   : {Config.PROCESS_RECYCLE_HOURS}h")
+    print(f"  First-scan suppress: {Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN}")
     print(f"  Dry run   : {dry_run}")
     print()
 
@@ -1240,17 +1423,36 @@ def run_monitor(
             print(f"Could not acquire worker lock (held by {lock.get('owner')}). Exiting.")
             return 2
         lock_acquired = True
-        global _last_lock_heartbeat
         _last_lock_heartbeat = time.monotonic()
         print(f"Worker lock acquired as {lock.get('self_owner')}")
     elif dry_run:
         print("Dry run: skipping worker lock and all writes")
 
-    driver = initialize_driver()
+    driver = None
+    try:
+        driver = initialize_driver()
+    except Exception as e:
+        code = classify_operational_failure(e)
+        send_error_email(
+            f"Browser start failed: {code}",
+            traceback.format_exc()[-3000:],
+            incident_key=code,
+        )
+        if lock_acquired:
+            try:
+                db.release_worker_lock()
+            except Exception:
+                pass
+        return 1
+
     try:
         if not setup_session(driver):
             print("Failed to authenticate FinTalent session.")
-            send_error_email("Authentication failed", "Could not log in to FinTalent. Check credentials.")
+            send_error_email(
+                "Authentication failed",
+                "Could not log in to FinTalent. Check credentials.",
+                incident_key="auth_failed",
+            )
             if not dry_run:
                 run_id = db.create_scraper_run(metadata={"phase": "auth"})
                 db.fail_scraper_run(run_id, failure_code="AUTH_FAILED", failure_reason="Login failed", status="AUTH_FAILED")
@@ -1271,7 +1473,11 @@ def run_monitor(
                 if not dry_run and lock_acquired and not ensure_worker_lock():
                     db.fail_scraper_run(run_id, failure_code="LOCK_LOST", failure_reason="Failed to renew lock")
                     print("Lock lost — aborting")
-                    send_error_email("Worker lock lost", "Another instance may have taken over. Exiting.")
+                    send_error_email(
+                        "Worker lock lost",
+                        "Another instance may have taken over. Exiting.",
+                        incident_key="lock_lost",
+                    )
                     return 2
 
                 driver.get(Config.TARGET_URL)
@@ -1279,6 +1485,11 @@ def run_monitor(
                 if "login" in driver.current_url.lower() or "auth" in driver.current_url.lower():
                     print("  Session expired. Logging in again...")
                     if not perform_login(driver):
+                        send_error_email(
+                            "Re-login failed",
+                            "Session expired and FinTalent re-login failed.",
+                            incident_key="auth_failed",
+                        )
                         if run_id:
                             db.fail_scraper_run(
                                 run_id, failure_code="AUTH_FAILED",
@@ -1298,13 +1509,13 @@ def run_monitor(
                 if not dry_run:
                     cold = db.is_platform_cold_start()
                 else:
-                    # dry-run cold detection still platform-specific
                     try:
                         cold = db.is_platform_cold_start()
                     except Exception:
                         cold = False
 
                 if cold:
+                    print("  Platform cold start: seeding with emails suppressed (COLD_START_SEED)")
                     counts = process_cold_start(
                         driver, run_id or "dry-run",
                         dry_run=dry_run, debug_extraction=debug_extraction or debug,
@@ -1322,13 +1533,25 @@ def run_monitor(
                                 "emails_sent", "emails_failed", "emails_suppressed",
                             )
                         })
-                    print(f"Cold start finished status={status} inserted={counts['projects_inserted']}")
+                    print(
+                        f"Cold start finished status={status} inserted={counts['projects_inserted']} "
+                        f"suppressed={counts['emails_suppressed']}"
+                    )
+                    _first_scan_pending = False
                 else:
+                    suppress_first = (
+                        _first_scan_pending
+                        and Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN
+                        and not dry_run
+                    )
+                    if suppress_first:
+                        print("  First scan after process start: emails suppressed (FIRST_RUN_SEED)")
                     counts = process_scan_cycle(
                         driver, run_id or "dry-run",
                         dry_run=dry_run,
                         debug_extraction=debug_extraction or debug,
-                        send_emails=not dry_run,
+                        send_emails=not dry_run and not suppress_first,
+                        force_suppress_emails=suppress_first,
                     )
                     if not dry_run:
                         try:
@@ -1336,6 +1559,11 @@ def run_monitor(
                             retry_pending_emails(dry_run=False)
                         except Exception as e:
                             print(f"  Enrichment/retry warning: {e}")
+                            send_error_email(
+                                f"Enrichment/retry warning: {type(e).__name__}",
+                                str(e),
+                                incident_key="enrichment_retry",
+                            )
                             counts["partial_failures"] = True
 
                     status = finalize_run_status(counts)
@@ -1353,43 +1581,82 @@ def run_monitor(
                         f"Scan done status={status} inserted={counts['projects_inserted']} "
                         f"skipped={counts['projects_skipped']} emailed={counts['emails_sent']}"
                     )
+                    _first_scan_pending = False
 
             except db.DatabaseError as e:
                 print(f"Database error: {e}")
-                send_error_email(f"Database error: {e.code}", str(e))
+                send_error_email(
+                    f"Database error: {e.code}",
+                    str(e),
+                    incident_key=f"db_{e.code}",
+                )
                 if run_id:
                     db.fail_scraper_run(run_id, failure_code=e.code, failure_reason=str(e))
                 if run_once:
                     return 1
             except Exception as e:
-                print(f"Check cycle failed: {e}. Reinitializing driver...")
-                send_error_email(f"Check cycle exception: {type(e).__name__}", traceback.format_exc()[-3000:])
+                failure_code = classify_operational_failure(e)
+                print(f"Check cycle failed ({failure_code}): {e}. Reinitializing driver...")
+                send_error_email(
+                    f"Check cycle exception: {failure_code}",
+                    traceback.format_exc()[-3000:],
+                    incident_key=failure_code,
+                )
                 traceback.print_exc()
                 if run_id:
                     try:
-                        db.fail_scraper_run(run_id, failure_code="SCAN_EXCEPTION", failure_reason=str(e)[:500])
+                        db.fail_scraper_run(
+                            run_id, failure_code=failure_code, failure_reason=str(e)[:500],
+                        )
                     except Exception:
                         pass
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                safe_quit_driver(driver)
+                driver = None
                 time.sleep(min(Config.CHECK_INTERVAL, 30))
-                driver = initialize_driver()
-                setup_session(driver)
+                try:
+                    driver = initialize_driver()
+                    setup_session(driver)
+                except Exception as start_err:
+                    start_code = classify_operational_failure(start_err)
+                    send_error_email(
+                        f"Browser restart failed: {start_code}",
+                        traceback.format_exc()[-3000:],
+                        incident_key=start_code,
+                    )
+                    if run_once:
+                        return 1
+                    sleep_between_cycles(
+                        Config.CHECK_INTERVAL,
+                        holding_lock=lock_acquired and not dry_run,
+                    )
+                    continue
 
             if run_once:
                 print("\nOnce mode complete. Exiting...")
                 break
+
+            if process_recycle_due(process_started_at):
+                print(
+                    f"Process recycle due after {Config.PROCESS_RECYCLE_HOURS}h — "
+                    "quitting browser, releasing lock, exiting for relaunch"
+                )
+                safe_quit_driver(driver)
+                driver = None
+                if lock_acquired:
+                    try:
+                        db.release_worker_lock()
+                        print("Worker lock released (recycle)")
+                        lock_acquired = False
+                    except Exception as e:
+                        print(f"Warning releasing lock on recycle: {e}")
+                return 0
+
             sleep_between_cycles(Config.CHECK_INTERVAL, holding_lock=lock_acquired and not dry_run)
 
     except KeyboardInterrupt:
         print("\nMonitor stopped by user.")
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        safe_quit_driver(driver)
         if lock_acquired:
             try:
                 db.release_worker_lock()

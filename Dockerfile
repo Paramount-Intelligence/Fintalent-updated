@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     gnupg \
     ca-certificates \
+    procps \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -41,5 +42,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY database.py extraction.py script_clean.py monitor.py fintalent_monitor.py ./
+COPY start.sh ./
 COPY scripts/ ./scripts/
-CMD ["python", "-u", "monitor.py"]
+RUN chmod +x /app/start.sh
+CMD ["/app/start.sh"]
